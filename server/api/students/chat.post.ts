@@ -1,16 +1,76 @@
 import { defineEventHandler, readBody } from "h3";
 import jwt from "jsonwebtoken";
 import { PrismaClient } from "@prisma/client";
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { GoogleGenerativeAI, HarmCategory, HarmBlockThreshold } from "@google/generative-ai";
 import axios from "axios";
+import NodeCache from "node-cache";
 
 // Inicializar Prisma y Google AI
 const prisma = new PrismaClient();
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || "");
 
-// Configuración del modelo
-const modelName = "gemini-1.5-pro";
-const maxOutputTokens = 8192;
+// Crear una instancia de caché con tiempo de expiración de 1 hora
+const cache = new NodeCache({ stdTTL: 3600, checkperiod: 120 });
+
+// Configuración de modelos - Nombres CORRECTOS de los modelos de Gemini
+const PRIMARY_MODEL = "gemini-1.5-flash"; // Modelo más rápido y con menos restricciones
+const FALLBACK_MODELS = ["gemini-pro", "gemini-pro-latest"]; // Modelos alternativos en orden de preferencia
+const maxOutputTokens = 2048; // Reducido para evitar exceder límites
+
+// Inicializar Google AI con manejo de múltiples claves API
+let apiKeys = (process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY || "").split(',').filter(Boolean);
+let currentKeyIndex = 0;
+
+// Función para obtener una instancia de Google AI con rotación de claves
+function getGeminiClient() {
+  if (!apiKeys.length) {
+    throw new Error("No se han configurado claves API para Gemini");
+  }
+  
+  // Rotación de claves para distribuir la carga
+  const key = apiKeys[currentKeyIndex];
+  currentKeyIndex = (currentKeyIndex + 1) % apiKeys.length;
+  
+  return new GoogleGenerativeAI(key);
+}
+
+// Función para obtener un modelo disponible
+async function getAvailableModel(preferredModel = PRIMARY_MODEL) {
+  const genAI = getGeminiClient();
+  
+  try {
+    // Intentar con el modelo preferido primero
+    const model = genAI.getGenerativeModel({ model: preferredModel });
+    // Hacer una pequeña prueba para verificar que el modelo funciona
+    await model.generateContent({
+      contents: [{ role: "user", parts: [{ text: "Hola" }] }],
+      generationConfig: { maxOutputTokens: 10 }
+    });
+    console.log(`Modelo ${preferredModel} disponible y funcionando`);
+    return { model, modelName: preferredModel };
+  } catch (error) {
+    console.error(`Error con modelo ${preferredModel}:`, error);
+    
+    // Si el modelo preferido falla, intentar con los modelos de respaldo
+    for (const fallbackModel of FALLBACK_MODELS) {
+      try {
+        console.log(`Intentando con modelo de respaldo: ${fallbackModel}`);
+        const model = genAI.getGenerativeModel({ model: fallbackModel });
+        // Hacer una pequeña prueba
+        await model.generateContent({
+          contents: [{ role: "user", parts: [{ text: "Hola" }] }],
+          generationConfig: { maxOutputTokens: 10 }
+        });
+        console.log(`Modelo ${fallbackModel} disponible y funcionando`);
+        return { model, modelName: fallbackModel };
+      } catch (fallbackError) {
+        console.error(`Error con modelo de respaldo ${fallbackModel}:`, fallbackError);
+      }
+    }
+    
+    // Si todos los modelos fallan, lanzar error
+    throw new Error("No hay modelos de IA disponibles en este momento");
+  }
+}
 
 // Configuración de YouTube API
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
@@ -41,38 +101,71 @@ interface Topic {
   inProgress: boolean;
 }
 
-// Sistema simple de limitación de tasa (rate limiting)
+// Definir interfaz para videos de YouTube
+interface VideoData {
+  provider: string;
+  videoId: string;
+  title: string;
+  description: string;
+  thumbnailUrl: string;
+}
+
+// Sistema mejorado de limitación de tasa (rate limiting)
 class RateLimiter {
-  private requests: Map<string, number[]> = new Map();
+  private requests = new Map<string, number[]>();
   private readonly limit: number;
   private readonly interval: number;
+  private readonly keyLimits = new Map<string, { count: number, resetTime: number }>();
 
-  constructor(limit = 5, interval = 60000) {
-    // 5 solicitudes por minuto
+  constructor(limit = 10, interval = 60000) { // Aumentado a 10 por minuto
     this.limit = limit;
     this.interval = interval;
   }
 
-  canMakeRequest(userId: number): boolean {
+  canMakeRequest(userId: number, apiKey?: string): boolean {
     const now = Date.now();
     const userKey = userId.toString();
 
+    // Verificar límite por usuario
     if (!this.requests.has(userKey)) {
       this.requests.set(userKey, [now]);
       return true;
     }
 
     const userRequests = this.requests.get(userKey)!;
-    const recentRequests = userRequests.filter(
-      (time) => time > now - this.interval
-    );
+    const recentRequests = userRequests.filter(time => time > now - this.interval);
 
-    if (recentRequests.length < this.limit) {
-      this.requests.set(userKey, [...recentRequests, now]);
-      return true;
+    // Si el usuario ha alcanzado su límite
+    if (recentRequests.length >= this.limit) {
+      return false;
     }
 
-    return false;
+    // Verificar límite por clave API si se proporciona
+    if (apiKey) {
+      if (!this.keyLimits.has(apiKey)) {
+        this.keyLimits.set(apiKey, { count: 1, resetTime: now + this.interval });
+        return true;
+      }
+
+      const keyLimit = this.keyLimits.get(apiKey)!;
+      
+      // Reiniciar contador si ha pasado el tiempo
+      if (now > keyLimit.resetTime) {
+        keyLimit.count = 1;
+        keyLimit.resetTime = now + this.interval;
+        return true;
+      }
+
+      // Verificar si la clave ha alcanzado su límite (50 por minuto para Gemini)
+      if (keyLimit.count >= 50) {
+        return false;
+      }
+
+      keyLimit.count++;
+    }
+
+    this.requests.set(userKey, [...recentRequests, now]);
+    return true;
   }
 
   getTimeUntilNextRequest(userId: number): number {
@@ -91,7 +184,17 @@ class RateLimiter {
 
 const rateLimiter = new RateLimiter();
 
-// Función para verificar token (ya que no tienes ~/server/utils/auth)
+// Almacenamiento persistente para mensajes de chat y datos de estudio
+// Usamos caché para mejorar el rendimiento
+const chatStorage = {
+  messages: new Map<number, Array<{ role: string; content: string; timestamp: Date }>>(),
+  currentTopics: new Map<number, string>(),
+  topicsProgress: new Map<number, Map<string, { progress: number; completed: boolean }>>(),
+  studyDocuments: new Map<number, Array<{ id: number; title: string; topics: string[]; type: string; url: string; }>>(),
+  quizzes: new Map<string, QuizData>(),
+};
+
+// Función para verificar token
 async function verifyToken(token: string) {
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET || "secret");
@@ -101,38 +204,17 @@ async function verifyToken(token: string) {
   }
 }
 
-// Almacenamiento en memoria para mensajes de chat y datos de estudio
-// En producción, deberías usar una base de datos real para esto
-const chatStorage = {
-  messages: new Map<
-    number,
-    Array<{ role: string; content: string; timestamp: Date }>
-  >(),
-  currentTopics: new Map<number, string>(),
-  topicsProgress: new Map<
-    number,
-    Map<string, { progress: number; completed: boolean }>
-  >(),
-  studyDocuments: new Map<
-    number,
-    Array<{
-      id: number;
-      title: string;
-      topics: string[];
-      type: string;
-      url: string;
-    }>
-  >(),
-  quizzes: new Map<string, QuizData>(), // Almacenamiento específico para quizzes
-};
-
-// Función para extraer temas de un documento usando la IA
-async function extractTopicsFromDocument(
-  model: any,
-  documentUrl: string,
-  documentName: string,
-  documentType: string
-): Promise<string[]> {
+// Función optimizada para extraer temas de un documento usando la IA
+async function extractTopicsFromDocument(documentUrl: string, documentName: string, documentType: string): Promise<string[]> {
+  // Crear clave de caché para este documento
+  const cacheKey = `topics_${documentName}_${documentType}`;
+  
+  // Verificar si ya tenemos los temas en caché
+  const cachedTopics = cache.get<string[]>(cacheKey);
+  if (cachedTopics) {
+    return cachedTopics;
+  }
+  
   try {
     // Determinar el tipo de documento para personalizar el prompt
     let documentTypeDesc = "documento";
@@ -146,43 +228,28 @@ async function extractTopicsFromDocument(
       documentTypeDesc = "presentación PowerPoint";
     }
 
-    // Construir un prompt para la IA que le pida extraer los temas principales
+    // Construir un prompt más corto y eficiente
     const prompt = `
-      Eres un asistente educativo especializado en analizar materiales de estudio.
+      Analiza este material educativo: "${documentName}" (${documentTypeDesc})
+      URL: ${documentUrl}
       
-      Necesito que analices el siguiente material educativo y extraigas los 3-5 temas principales que cubre.
-      
-      Información del documento:
-      - Nombre: ${documentName}
-      - Tipo: ${documentTypeDesc}
-      - URL: ${documentUrl}
-      
-      Basándote en el nombre del documento y tu conocimiento sobre materiales educativos, identifica los temas principales que probablemente cubre este material.
-      
-      Por favor, lista solo los nombres de los temas principales, separados por comas.
-      No incluyas descripciones, solo los nombres de los temas.
-      
-      Ejemplo de respuesta para un documento de física: "Cinemática, Leyes de Newton, Conservación de Energía"
-      Ejemplo de respuesta para un documento de matemáticas: "Álgebra Lineal, Matrices, Determinantes"
+      Extrae 3-5 temas principales que probablemente cubre.
+      Responde SOLO con los nombres de los temas separados por comas.
+      Ejemplo: "Cinemática, Leyes de Newton, Conservación de Energía"
     `;
 
-    // Crear una conversación con la IA
-    const chat = model.startChat({
-      history: [
-        {
-          role: "user",
-          parts: [{ text: prompt }],
-        },
-      ],
-      generationConfig: {
-        maxOutputTokens: 1024,
-        temperature: 0.2, // Temperatura baja para respuestas más precisas
-      },
-    });
+    // Obtener un modelo disponible
+    const { model } = await getAvailableModel();
 
-    const result = await chat.sendMessage(
-      "Extrae los temas principales de este documento educativo."
-    );
+    // Crear una conversación con la IA
+    const result = await model.generateContent({
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+      generationConfig: {
+        maxOutputTokens: 256,
+        temperature: 0.1,
+      }
+    });
+    
     const response = await result.response;
     const topicsText = response.text();
 
@@ -195,9 +262,12 @@ async function extractTopicsFromDocument(
     // Si no se encontraron temas, usar el nombre del documento como tema
     if (topics.length === 0) {
       const docName = documentName.split(".")[0];
+      cache.set(cacheKey, [docName]);
       return [docName];
     }
 
+    // Guardar en caché para futuras solicitudes
+    cache.set(cacheKey, topics);
     return topics;
   } catch (error) {
     console.error("Error al extraer temas del documento:", error);
@@ -207,202 +277,244 @@ async function extractTopicsFromDocument(
   }
 }
 
-// Función para generar contenido del tema con mejor formato
-const generateTopicContent = async (model: any, topic: string) => {
-  const prompt = `
-    Actúa como un tutor experto en ${topic}. 
-    Proporciona una explicación estructurada y clara sobre este tema.
-    
-    Estructura tu respuesta con el siguiente formato exacto para facilitar el procesamiento:
-
-    # ${topic}
-
-    ## Definición
-    [Proporciona una definición clara y concisa del concepto]
-
-    ## Conceptos Clave
-    - **[Concepto 1]**: [Breve explicación]
-    - **[Concepto 2]**: [Breve explicación]
-    - **[Concepto 3]**: [Breve explicación]
-
-    ## Explicación Detallada
-    [Desarrolla una explicación profunda del tema, usando párrafos bien estructurados]
-
-    ## Ejemplo Resuelto
-    Problema: [Plantea un problema práctico]
-    
-    Solución:
-    1. [Primer paso con explicación]
-    2. [Segundo paso con explicación]
-    3. [Tercer paso con explicación]
-    
-    Conclusión: [Resultado final]
-
-    ## Aplicaciones Prácticas
-    1. [Primera aplicación]
-    2. [Segunda aplicación]
-    3. [Tercera aplicación]
-
-    Asegúrate de usar exactamente los encabezados y formato indicados para facilitar el procesamiento.
-  `;
-
-  // Asegurar que el primer mensaje sea del usuario
-  const chat = model.startChat({
-    history: [
-      {
-        role: "user",
-        parts: [{ text: `Quiero aprender sobre ${topic}` }],
-      },
-    ],
-    generationConfig: {
-      maxOutputTokens: maxOutputTokens,
-    },
-  });
-
-  const result = await chat.sendMessage(prompt);
-  const response = await result.response;
-  return response.text();
-};
-
-// Función para generar ejemplos adicionales
-const generateAdditionalExamples = async (model: any, topic: string) => {
-  const prompt = `
-    Genera dos ejemplos detallados sobre ${topic}.
-    
-    Para cada ejemplo, usa este formato exacto:
-
-    # Ejemplo 1: [Título descriptivo]
-    
-    ## Problema
-    [Descripción clara del problema a resolver]
-
-    ## Solución Paso a Paso
-    1. [Primer paso]
-       * **Explicación**: [Por qué hacemos este paso]
-       * **Cálculos**: [Detalles matemáticos si aplican]
-    
-    2. [Segundo paso]
-       * **Explicación**: [Por qué hacemos este paso]
-       * **Cálculos**: [Detalles matemáticos si aplican]
-    
-    3. [Tercer paso]
-       * **Explicación**: [Por qué hacemos este paso]
-       * **Cálculos**: [Detalles matemáticos si aplican]
-
-    ## Conclusión
-    [Resumen del resultado y su significado]
-
-    # Ejemplo 2: [Título descriptivo]
-    [Mismo formato que el ejemplo 1]
-    
-    Asegúrate de usar exactamente los encabezados y formato indicados para facilitar el procesamiento.
-  `;
-
-  // Asegurar que el primer mensaje sea del usuario
-  const chat = model.startChat({
-    history: [
-      {
-        role: "user",
-        parts: [{ text: `Necesito ejemplos prácticos sobre ${topic}` }],
-      },
-    ],
-    generationConfig: {
-      maxOutputTokens: maxOutputTokens,
-    },
-  });
-
-  const result = await chat.sendMessage(prompt);
-  const response = await result.response;
-  return response.text();
-};
-
-// Función para generar preguntas de quiz
-const generateQuiz = async (model: any, topic: string) => {
-  const prompt = `
-    Genera una pregunta de evaluación sobre ${topic}.
-    
-    La pregunta debe:
-    1. Evaluar comprensión profunda del tema
-    2. Tener 4 opciones (A, B, C, D)
-    3. Incluir una explicación detallada de la solución
-    
-    Usa este formato exacto:
-
-    PREGUNTA
-    [Texto de la pregunta]
-
-    OPCIONES
-    A) [Opción A]
-    B) [Opción B]
-    C) [Opción C]
-    D) [Opción D]
-
-    RESPUESTA_CORRECTA
-    [Letra de la respuesta correcta]
-
-    EXPLICACION
-    1. **Análisis del problema**:
-       [Explicar cómo abordar el problema]
-    
-    2. **Proceso de solución**:
-       [Detallar paso a paso cómo se llega a la respuesta]
-    
-    3. **Por qué las otras opciones son incorrectas**:
-       - Opción [X]: [Explicar por qué es incorrecta]
-       - Opción [Y]: [Explicar por qué es incorrecta]
-       - Opción [Z]: [Explicar por qué es incorrecta]
-    
-    4. **Conclusión**:
-       [Reforzar el concepto clave evaluado]
-  `;
-
-  // Asegurar que el primer mensaje sea del usuario
-  const chat = model.startChat({
-    history: [
-      {
-        role: "user",
-        parts: [{ text: `Necesito una pregunta de quiz sobre ${topic}` }],
-      },
-    ],
-    generationConfig: {
-      maxOutputTokens: maxOutputTokens,
-    },
-  });
-
-  const result = await chat.sendMessage(prompt);
-  const response = await result.response;
-  const responseText = response.text();
-
-  // Extraer las partes del quiz
-  const questionMatch = responseText.match(/PREGUNTA\n([\s\S]*?)\n\nOPCIONES/);
-  const optionsMatch = responseText.match(
-    /OPCIONES\n([\s\S]*?)\n\nRESPUESTA_CORRECTA/
-  );
-  const answerMatch = responseText.match(/RESPUESTA_CORRECTA\n([A-D])/);
-  const explanationMatch = responseText.match(/EXPLICACION\n([\s\S]*?)$/);
-
-  // Extraer las opciones individuales
-  let options: string[] = [];
-  if (optionsMatch && optionsMatch[1]) {
-    const optionsText = optionsMatch[1].trim();
-    options = [
-      optionsText.match(/A\)(.*?)(?=\nB\)|$)/s)?.[1]?.trim() || "",
-      optionsText.match(/B\)(.*?)(?=\nC\)|$)/s)?.[1]?.trim() || "",
-      optionsText.match(/C\)(.*?)(?=\nD\)|$)/s)?.[1]?.trim() || "",
-      optionsText.match(/D\)(.*?)(?=\n|$)/s)?.[1]?.trim() || "",
-    ];
+// Función optimizada para generar contenido del tema
+const generateTopicContent = async (topic: string, retryCount = 0): Promise<string> => {
+  // Verificar caché primero
+  const cacheKey = `topic_content_${topic}`;
+  const cachedContent = cache.get<string>(cacheKey);
+  if (cachedContent) {
+    return cachedContent;
   }
+  
+  try {
+    const prompt = `
+      Actúa como un tutor experto en ${topic}. 
+      Proporciona una explicación estructurada con este formato:
 
-  return {
-    question: questionMatch ? questionMatch[1].trim() : "",
-    options: options,
-    correctAnswer: answerMatch ? answerMatch[1] : "",
-    explanation: explanationMatch ? explanationMatch[1].trim() : "",
-  };
+      # ${topic}
+
+      ## Definición
+      [Definición concisa]
+
+      ## Conceptos Clave
+      - **[Concepto 1]**: [Explicación breve]
+      - **[Concepto 2]**: [Explicación breve]
+      - **[Concepto 3]**: [Explicación breve]
+
+      ## Explicación Detallada
+      [Explicación en párrafos]
+
+      ## Ejemplo Resuelto
+      Problema: [Problema práctico]
+      
+      Solución:
+      1. [Primer paso]
+      2. [Segundo paso]
+      3. [Tercer paso]
+      
+      Conclusión: [Resultado]
+
+      ## Aplicaciones Prácticas
+      1. [Primera aplicación]
+      2. [Segunda aplicación]
+      3. [Tercera aplicación]
+    `;
+
+    // Obtener un modelo disponible
+    const { model } = await getAvailableModel();
+
+    const result = await model.generateContent({
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+      generationConfig: {
+        maxOutputTokens: maxOutputTokens,
+        temperature: 0.3,
+      }
+    });
+    
+    const response = await result.response;
+    const content = response.text();
+    
+    // Guardar en caché para futuras solicitudes
+    cache.set(cacheKey, content, 86400); // Caché por 24 horas
+    
+    return content;
+  } catch (error: any) {
+    console.error(`Error al generar contenido (intento ${retryCount + 1}):`, error);
+    
+    // Si es un error de cuota y tenemos más intentos, probar de nuevo
+    if (error.status === 429 && retryCount < 2) {
+      // Esperar un poco antes de reintentar
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      return generateTopicContent(topic, retryCount + 1);
+    }
+    
+    throw error;
+  }
 };
 
-// Función para buscar videos en YouTube
-async function buscarVideoYouTube(tema: string) {
+// Función optimizada para generar ejemplos adicionales
+const generateAdditionalExamples = async (topic: string, retryCount = 0): Promise<string> => {
+  // Verificar caché primero
+  const cacheKey = `examples_${topic}`;
+  const cachedExamples = cache.get<string>(cacheKey);
+  if (cachedExamples) {
+    return cachedExamples;
+  }
+  
+  try {
+    const prompt = `
+      Genera dos ejemplos sobre ${topic} con este formato:
+
+      # Ejemplo 1: [Título]
+      
+      ## Problema
+      [Descripción del problema]
+
+      ## Solución Paso a Paso
+      1. [Primer paso]
+         * **Explicación**: [Explicación]
+      
+      2. [Segundo paso]
+         * **Explicación**: [Explicación]
+      
+      3. [Tercer paso]
+         * **Explicación**: [Explicación]
+
+      ## Conclusión
+      [Resumen del resultado]
+
+      # Ejemplo 2: [Título]
+      [Mismo formato]
+    `;
+
+    // Obtener un modelo disponible
+    const { model } = await getAvailableModel();
+
+    const result = await model.generateContent({
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+      generationConfig: {
+        maxOutputTokens: maxOutputTokens,
+        temperature: 0.4,
+      }
+    });
+    
+    const response = await result.response;
+    const examples = response.text();
+    
+    // Guardar en caché para futuras solicitudes
+    cache.set(cacheKey, examples, 86400); // Caché por 24 horas
+    
+    return examples;
+  } catch (error: any) {
+    console.error(`Error al generar ejemplos (intento ${retryCount + 1}):`, error);
+    
+    // Si es un error de cuota y tenemos más intentos, probar de nuevo
+    if (error.status === 429 && retryCount < 2) {
+      // Esperar un poco antes de reintentar
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      return generateAdditionalExamples(topic, retryCount + 1);
+    }
+    
+    throw error;
+  }
+};
+
+// Función optimizada para generar preguntas de quiz
+const generateQuiz = async (topic: string, retryCount = 0): Promise<QuizData> => {
+  // Verificar caché primero
+  const cacheKey = `quiz_${topic}`;
+  const cachedQuiz = cache.get<QuizData>(cacheKey);
+  if (cachedQuiz) {
+    return cachedQuiz;
+  }
+  
+  try {
+    const prompt = `
+      Genera una pregunta de evaluación sobre ${topic} con este formato:
+
+      PREGUNTA
+      [Texto de la pregunta]
+
+      OPCIONES
+      A) [Opción A]
+      B) [Opción B]
+      C) [Opción C]
+      D) [Opción D]
+
+      RESPUESTA_CORRECTA
+      [Letra de la respuesta correcta]
+
+      EXPLICACION
+      [Explicación detallada]
+    `;
+
+    // Obtener un modelo disponible
+    const { model } = await getAvailableModel();
+
+    const result = await model.generateContent({
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+      generationConfig: {
+        maxOutputTokens: 2048, // Reducido para quiz
+        temperature: 0.3,
+      }
+    });
+    
+    const response = await result.response;
+    const responseText = response.text();
+
+    // Extraer las partes del quiz
+    const questionMatch = responseText.match(/PREGUNTA\n([\s\S]*?)\n\nOPCIONES/);
+    const optionsMatch = responseText.match(/OPCIONES\n([\s\S]*?)\n\nRESPUESTA_CORRECTA/);
+    const answerMatch = responseText.match(/RESPUESTA_CORRECTA\n([A-D])/);
+    const explanationMatch = responseText.match(/EXPLICACION\n([\s\S]*?)$/);
+
+    // Extraer las opciones individuales
+    let options: string[] = [];
+    if (optionsMatch && optionsMatch[1]) {
+      const optionsText = optionsMatch[1].trim();
+      options = [
+        optionsText.match(/A\)(.*?)(?=\nB\)|$)/s)?.[1]?.trim() || "",
+        optionsText.match(/B\)(.*?)(?=\nC\)|$)/s)?.[1]?.trim() || "",
+        optionsText.match(/C\)(.*?)(?=\nD\)|$)/s)?.[1]?.trim() || "",
+        optionsText.match(/D\)(.*?)(?=\n|$)/s)?.[1]?.trim() || "",
+      ];
+    }
+
+    const quizData = {
+      question: questionMatch ? questionMatch[1].trim() : "",
+      options: options,
+      correctAnswer: answerMatch ? answerMatch[1] : "",
+      explanation: explanationMatch ? explanationMatch[1].trim() : "",
+      timestamp: new Date()
+    };
+    
+    // Guardar en caché para futuras solicitudes
+    cache.set(cacheKey, quizData, 86400); // Caché por 24 horas
+    
+    return quizData;
+  } catch (error: any) {
+    console.error(`Error al generar quiz (intento ${retryCount + 1}):`, error);
+    
+    // Si es un error de cuota y tenemos más intentos, probar de nuevo
+    if (error.status === 429 && retryCount < 2) {
+      // Esperar un poco antes de reintentar
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      return generateQuiz(topic, retryCount + 1);
+    }
+    
+    throw error;
+  }
+};
+
+// Función optimizada para buscar videos en YouTube con caché
+async function buscarVideoYouTube(tema: string): Promise<VideoData> {
+  // Verificar caché primero
+  const cacheKey = `video_${tema}`;
+  const cachedVideo = cache.get<VideoData>(cacheKey);
+  if (cachedVideo) {
+    return cachedVideo;
+  }
+  
   if (!YOUTUBE_API_KEY) {
     throw new Error("YouTube API Key no configurada");
   }
@@ -425,25 +537,28 @@ async function buscarVideoYouTube(tema: string) {
     }
 
     const video = response.data.items[0];
-
-    return {
+    const videoData: VideoData = {
       provider: "youtube",
       videoId: video.id.videoId,
       title: video.snippet.title,
       description: video.snippet.description,
       thumbnailUrl: video.snippet.thumbnails.high.url,
     };
+    
+    // Guardar en caché para futuras solicitudes
+    cache.set(cacheKey, videoData, 86400); // Caché por 24 horas
+    
+    return videoData;
   } catch (error) {
     console.error("Error al buscar videos en YouTube:", error);
     throw error;
   }
 }
 
-// Función para procesar el texto de respuesta y extraer secciones estructuradas
+// Función optimizada para procesar el texto de respuesta
 function procesarContenidoTema(responseText: string) {
   // Extraer título
-  const titleMatch =
-    responseText.match(/^#\s*(.*?)$/m) || responseText.match(/^(.*?)$/m);
+  const titleMatch = responseText.match(/^#\s*(.*?)$/m) || responseText.match(/^(.*?)$/m);
   const title = titleMatch ? titleMatch[1].trim() : "";
 
   // Extraer definición
@@ -457,13 +572,10 @@ function procesarContenidoTema(responseText: string) {
   const conceptsText = conceptsMatch ? conceptsMatch[1] : "";
 
   // Procesar cada concepto
-  const conceptLines = conceptsText
-    .split("\n")
-    .filter((line) => line.trim().startsWith("-"));
-  const concepts = conceptLines.map((line) => {
+  const conceptLines = conceptsText.split("\n").filter(line => line.trim().startsWith("-"));
+  const concepts = conceptLines.map(line => {
     const cleanLine = line.replace(/^-\s*/, "").trim();
-    const titleMatch =
-      cleanLine.match(/\*\*(.*?)\*\*:(.*)/) || cleanLine.match(/(.*?):(.*)/);
+    const titleMatch = cleanLine.match(/\*\*(.*?)\*\*:(.*)/) || cleanLine.match(/(.*?):(.*)/);
 
     if (titleMatch) {
       return {
@@ -507,12 +619,8 @@ function procesarContenidoTema(responseText: string) {
   const applicationsText = applicationsMatch ? applicationsMatch[1] : "";
 
   // Procesar aplicaciones
-  const applicationLines = applicationsText
-    .split("\n")
-    .filter((line) => /^\d+\./.test(line.trim()));
-  const applications = applicationLines.map((line) =>
-    line.replace(/^\d+\.\s*/, "").trim()
-  );
+  const applicationLines = applicationsText.split("\n").filter(line => /^\d+\./.test(line.trim()));
+  const applications = applicationLines.map(line => line.replace(/^\d+\.\s*/, "").trim());
 
   return {
     title,
@@ -528,6 +636,48 @@ function procesarContenidoTema(responseText: string) {
   };
 }
 
+// Función para generar respuesta de texto simple cuando la IA no está disponible
+function generateFallbackResponse(topic: string | null = null): string {
+  if (topic) {
+    return `Lo siento, en este momento no puedo generar contenido detallado sobre ${topic} debido a limitaciones técnicas. Por favor, intenta de nuevo más tarde o consulta otras fuentes de información sobre este tema.`;
+  }
+  
+  return "Lo siento, en este momento no puedo procesar tu solicitud debido a limitaciones técnicas. Por favor, intenta de nuevo más tarde.";
+}
+
+// Función para manejar errores de forma consistente
+function handleApiError(error: any, userId: number) {
+  console.error("Error en la API:", error);
+  
+  // Si es un error de límite de tasa
+  if (error.status === 429) {
+    return {
+      status: 429,
+      message: "Has alcanzado el límite de solicitudes. Por favor, intenta de nuevo en unos minutos.",
+      waitTime: rateLimiter.getTimeUntilNextRequest(userId),
+      messageType: "error",
+    };
+  }
+  
+  // Si es un error de modelo no encontrado
+  if (error.status === 404) {
+    return {
+      status: 503,
+      message: "El servicio de IA no está disponible en este momento. Por favor, intenta de nuevo más tarde.",
+      messageType: "error",
+    };
+  }
+  
+  // Para otros errores
+  return {
+    status: 500,
+    message: "Ocurrió un error al procesar tu solicitud. Por favor, intenta de nuevo más tarde.",
+    error: error.message,
+    messageType: "error",
+  };
+}
+
+// Manejador principal de eventos
 export default defineEventHandler(async (event) => {
   try {
     // Verificar autenticación
@@ -576,28 +726,10 @@ export default defineEventHandler(async (event) => {
     // Obtener historial de chat
     const chatHistory = chatStorage.messages.get(userId) || [];
 
-    // Formatear historial para el modelo - CORREGIDO PARA ASEGURAR QUE EL PRIMER MENSAJE SEA DEL USUARIO
-    let formattedHistory = chatHistory.map((msg) => ({
-      role: msg.role,
-      parts: [{ text: msg.content }],
-    }));
-
-    // Si el historial está vacío o el primer mensaje no es del usuario, añadir un mensaje inicial del usuario
-    if (formattedHistory.length === 0 || formattedHistory[0].role !== "user") {
-      formattedHistory = [
-        {
-          role: "user",
-          parts: [{ text: "Hola, soy un estudiante que necesita ayuda." }],
-        },
-        ...formattedHistory,
-      ];
-    }
-
     // Si es un mensaje de inicio, devolver información inicial
     if (userMessage === "inicio") {
-      // IMPORTANTE: Siempre obtener los documentos más recientes de la base de datos
       try {
-        // Obtener materiales reales de la base de datos
+        // Obtener materiales de la base de datos
         const materials = await prisma.material.findMany({
           where: {
             idAsignatura: decoded.asignaturaId,
@@ -619,45 +751,47 @@ export default defineEventHandler(async (event) => {
           },
         });
 
-        // Inicializar el modelo de IA para extraer temas
-        const model = genAI.getGenerativeModel({ model: modelName });
-
-        // Convertir los materiales al formato esperado por el chat y extraer temas con IA
+        // Convertir los materiales al formato esperado y extraer temas
         const studyDocsPromises = materials.map(async (material) => {
-          // Extraer temas del documento usando la IA
-          const topics = await extractTopicsFromDocument(
-            model,
-            material.url,
-            material.nombre,
-            material.tipo
-          );
-
-          return {
-            id: material.id,
-            title: material.nombre,
-            topics: topics, // Usar los temas extraídos por la IA
-            type: material.tipo.split("/").pop() || "document",
-            url: material.url,
-          };
+          try {
+            // Extraer temas del documento usando la IA
+            const topics = await extractTopicsFromDocument(
+              material.url,
+              material.nombre,
+              material.tipo
+            );
+            
+            return {
+              id: material.id,
+              title: material.nombre,
+              topics: topics,
+              type: material.tipo.split("/").pop() || "document",
+              url: material.url,
+            };
+          } catch (error) {
+            console.error(`Error al procesar material ${material.nombre}:`, error);
+            // En caso de error, usar el nombre del documento como tema
+            return {
+              id: material.id,
+              title: material.nombre,
+              topics: [material.nombre.split(".")[0]],
+              type: material.tipo.split("/").pop() || "document",
+              url: material.url,
+            };
+          }
         });
 
-        // Esperar a que se completen todas las extracciones de temas
+        // Procesar en paralelo para mejorar rendimiento
         const studyDocs = await Promise.all(studyDocsPromises);
-
-        // Actualizar los documentos de estudio para este usuario
         chatStorage.studyDocuments.set(userId, studyDocs);
       } catch (error) {
         console.error("Error al obtener materiales:", error);
-        // Si hay error, establecer una lista vacía
         chatStorage.studyDocuments.set(userId, []);
       }
 
       // Obtener documentos y temas
       const documents = chatStorage.studyDocuments.get(userId) || [];
-
-      // Obtener progreso de temas
-      const topicsProgressMap =
-        chatStorage.topicsProgress.get(userId) || new Map();
+      const topicsProgressMap = chatStorage.topicsProgress.get(userId) || new Map();
 
       // Convertir el mapa de progreso a un array
       const formattedTopics = Array.from(topicsProgressMap.entries()).map(
@@ -669,20 +803,21 @@ export default defineEventHandler(async (event) => {
         })
       );
 
-      // Extraer temas de los documentos reales
+      // Extraer temas de los documentos
       const defaultTopics: Topic[] = [];
-
-      // Si hay documentos, extraer temas de ellos
       if (documents.length > 0) {
         documents.forEach((doc) => {
           if (doc.topics && doc.topics.length > 0) {
             doc.topics.forEach((topic) => {
-              defaultTopics.push({
-                name: topic,
-                progress: 0,
-                completed: false,
-                inProgress: false,
-              });
+              // Evitar duplicados
+              if (!defaultTopics.some(t => t.name === topic)) {
+                defaultTopics.push({
+                  name: topic,
+                  progress: 0,
+                  completed: false,
+                  inProgress: false,
+                });
+              }
             });
           }
         });
@@ -737,7 +872,7 @@ export default defineEventHandler(async (event) => {
         },
         estudiante: {
           nombre: estudiante.nombre,
-          nivel: Math.floor(estudiante.xp / 100) + 1, // Calcular nivel basado en XP
+          nivel: Math.floor(estudiante.xp / 100) + 1,
         },
         xp: estudiante.xp || 0,
         topics: formattedTopics.length > 0 ? formattedTopics : defaultTopics,
@@ -753,8 +888,7 @@ export default defineEventHandler(async (event) => {
       chatStorage.currentTopics.set(userId, topic);
 
       // Verificar si el tema existe en el almacenamiento
-      const topicsProgressMap =
-        chatStorage.topicsProgress.get(userId) || new Map();
+      const topicsProgressMap = chatStorage.topicsProgress.get(userId) || new Map();
 
       if (!topicsProgressMap.has(topic)) {
         topicsProgressMap.set(topic, { progress: 0, completed: false });
@@ -774,12 +908,9 @@ export default defineEventHandler(async (event) => {
         };
       }
 
-      // Generar contenido del tema con Gemini
-      const model = genAI.getGenerativeModel({ model: modelName });
-
       try {
-        // Usar la nueva función para generar contenido estructurado
-        const responseText = await generateTopicContent(model, topic);
+        // Generar contenido del tema
+        const responseText = await generateTopicContent(topic);
 
         // Procesar el contenido para obtener secciones estructuradas
         const contenidoProcesado = procesarContenidoTema(responseText);
@@ -814,14 +945,20 @@ export default defineEventHandler(async (event) => {
 
         // Generar un quiz para tener listo (en segundo plano)
         try {
-          const quizData = await generateQuiz(model, topic);
-          const quizKey = `${userId}_lastQuiz`;
-          chatStorage.quizzes.set(quizKey, {
-            ...quizData,
-            timestamp: new Date(),
-          });
+          // Usamos setTimeout para no bloquear la respuesta principal
+          setTimeout(async () => {
+            try {
+              const quizData = await generateQuiz(topic);
+              const quizKey = `${userId}_lastQuiz`;
+              chatStorage.quizzes.set(quizKey, {
+                ...quizData,
+                timestamp: new Date(),
+              });
+            } catch (error) {
+              console.error("Error al generar quiz en segundo plano:", error);
+            }
+          }, 100);
         } catch (error) {
-          console.error("Error al generar quiz en segundo plano:", error);
           // No interrumpimos el flujo principal si falla la generación del quiz
         }
 
@@ -837,24 +974,28 @@ export default defineEventHandler(async (event) => {
             applications: contenidoProcesado.applications,
           },
           currentTopic: topic,
-          rawContent: responseText, // Incluir el contenido sin procesar por si acaso
+          rawContent: responseText,
         };
       } catch (error: any) {
-        console.error("Error al generar contenido con Gemini:", error);
-
-        // Manejar error de límite de tasa
-        if (error.status === 429) {
-          return {
-            status: 429,
-            message:
-              "Has alcanzado el límite de solicitudes de la API. Por favor, intenta de nuevo en unos minutos.",
-            messageType: "error",
-            error: error.message,
-          };
-        }
-
+        // Si hay un error con la IA, proporcionar una respuesta de respaldo
+        const fallbackResponse = generateFallbackResponse(topic);
+        
+        // Guardar mensaje en el almacenamiento
+        const chatMessages = chatStorage.messages.get(userId) || [];
+        chatMessages.push({
+          role: "user",
+          content: `Quiero aprender sobre ${topic}`,
+          timestamp: new Date(),
+        });
+        chatMessages.push({
+          role: "model",
+          content: fallbackResponse,
+          timestamp: new Date(),
+        });
+        chatStorage.messages.set(userId, chatMessages);
+        
         return {
-          text: `Lo siento, tuve un problema al generar información sobre ${topic}. Por favor, intenta de nuevo más tarde.`,
+          text: fallbackResponse,
           messageType: "response",
           error: error.message,
         };
@@ -890,8 +1031,7 @@ export default defineEventHandler(async (event) => {
       }
 
       try {
-        const model = genAI.getGenerativeModel({ model: modelName });
-        const examples = await generateAdditionalExamples(model, temaActual);
+        const examples = await generateAdditionalExamples(temaActual);
 
         // Guardar mensaje en el almacenamiento
         const chatMessages = chatStorage.messages.get(userId) || [];
@@ -910,8 +1050,7 @@ export default defineEventHandler(async (event) => {
         chatStorage.messages.set(userId, chatMessages);
 
         // Actualizar progreso
-        const topicsProgressMap =
-          chatStorage.topicsProgress.get(userId) || new Map();
+        const topicsProgressMap = chatStorage.topicsProgress.get(userId) || new Map();
         const topicData = topicsProgressMap.get(temaActual) || {
           progress: 0,
           completed: false,
@@ -970,22 +1109,27 @@ export default defineEventHandler(async (event) => {
           rawContent: examples,
         };
       } catch (error: any) {
-        console.error("Error al generar ejemplos:", error);
-
-        // Manejar error de límite de tasa
-        if (error.status === 429) {
-          return {
-            status: 429,
-            message:
-              "Has alcanzado el límite de solicitudes de la API. Por favor, intenta de nuevo en unos minutos.",
-            messageType: "error",
-            error: error.message,
-          };
-        }
-
+        // Si hay un error con la IA, proporcionar una respuesta de respaldo
+        const fallbackResponse = `Lo siento, en este momento no puedo generar ejemplos adicionales sobre ${temaActual}. Por favor, intenta de nuevo más tarde.`;
+        
+        // Guardar mensaje en el almacenamiento
+        const chatMessages = chatStorage.messages.get(userId) || [];
+        chatMessages.push({
+          role: "user",
+          content: userMessage,
+          timestamp: new Date(),
+        });
+        chatMessages.push({
+          role: "model",
+          content: fallbackResponse,
+          timestamp: new Date(),
+        });
+        chatStorage.messages.set(userId, chatMessages);
+        
         return {
-          text: "Lo siento, hubo un problema al generar los ejemplos. Por favor, intenta de nuevo.",
-          messageType: "error",
+          text: fallbackResponse,
+          messageType: "response",
+          error: error.message,
         };
       }
     }
@@ -1016,8 +1160,7 @@ export default defineEventHandler(async (event) => {
       if (isCorrect) {
         const temaActual = chatStorage.currentTopics.get(userId);
         if (temaActual) {
-          const topicsProgressMap =
-            chatStorage.topicsProgress.get(userId) || new Map();
+          const topicsProgressMap = chatStorage.topicsProgress.get(userId) || new Map();
           const topicData = topicsProgressMap.get(temaActual) || {
             progress: 0,
             completed: false,
@@ -1117,8 +1260,7 @@ export default defineEventHandler(async (event) => {
         chatStorage.messages.set(userId, chatMessages);
 
         // Actualizar progreso
-        const topicsProgressMap =
-          chatStorage.topicsProgress.get(userId) || new Map();
+        const topicsProgressMap = chatStorage.topicsProgress.get(userId) || new Map();
         const topicData = topicsProgressMap.get(temaActual) || {
           progress: 0,
           completed: false,
@@ -1132,9 +1274,25 @@ export default defineEventHandler(async (event) => {
           videoData: videoData,
         };
       } catch (error: any) {
-        console.error("Error al buscar videos de YouTube:", error);
+        // Si hay un error con la API de YouTube, proporcionar una respuesta de respaldo
+        const fallbackResponse = `Lo siento, no pude encontrar videos sobre ${temaActual} en este momento. Por favor, intenta de nuevo más tarde o busca directamente en YouTube.`;
+        
+        // Guardar mensaje en el almacenamiento
+        const chatMessages = chatStorage.messages.get(userId) || [];
+        chatMessages.push({
+          role: "user",
+          content: userMessage,
+          timestamp: new Date(),
+        });
+        chatMessages.push({
+          role: "model",
+          content: fallbackResponse,
+          timestamp: new Date(),
+        });
+        chatStorage.messages.set(userId, chatMessages);
+        
         return {
-          text: `Lo siento, tuve un problema al buscar videos sobre ${temaActual}. Por favor, intenta de nuevo más tarde.`,
+          text: fallbackResponse,
           messageType: "response",
           error: error.message,
         };
@@ -1171,10 +1329,9 @@ export default defineEventHandler(async (event) => {
         };
       }
 
-      // Generar quiz con Gemini
+      // Generar quiz
       try {
-        const model = genAI.getGenerativeModel({ model: modelName });
-        const quizData = await generateQuiz(model, temaActual);
+        const quizData = await generateQuiz(temaActual);
 
         // Guardar el quiz actual en el almacenamiento para verificar la respuesta después
         const quizKey = `${userId}_lastQuiz`;
@@ -1210,21 +1367,25 @@ export default defineEventHandler(async (event) => {
           },
         };
       } catch (error: any) {
-        console.error("Error al generar quiz con Gemini:", error);
-
-        // Manejar error de límite de tasa
-        if (error.status === 429) {
-          return {
-            status: 429,
-            message:
-              "Has alcanzado el límite de solicitudes de la API. Por favor, intenta de nuevo en unos minutos.",
-            messageType: "error",
-            error: error.message,
-          };
-        }
-
+        // Si hay un error con la IA, proporcionar una respuesta de respaldo
+        const fallbackResponse = `Lo siento, en este momento no puedo generar preguntas de evaluación sobre ${temaActual}. Por favor, intenta de nuevo más tarde.`;
+        
+        // Guardar mensaje en el almacenamiento
+        const chatMessages = chatStorage.messages.get(userId) || [];
+        chatMessages.push({
+          role: "user",
+          content: userMessage,
+          timestamp: new Date(),
+        });
+        chatMessages.push({
+          role: "model",
+          content: fallbackResponse,
+          timestamp: new Date(),
+        });
+        chatStorage.messages.set(userId, chatMessages);
+        
         return {
-          text: `Lo siento, tuve un problema al generar preguntas sobre ${temaActual}. Por favor, intenta de nuevo más tarde.`,
+          text: fallbackResponse,
           messageType: "response",
           error: error.message,
         };
@@ -1246,69 +1407,98 @@ export default defineEventHandler(async (event) => {
         };
       }
 
-      const model = genAI.getGenerativeModel({ model: modelName });
-
       // Construir contexto para el modelo
       const temaActual = chatStorage.currentTopics.get(userId);
-      const nivelEstudiante = Math.floor(estudiante.xp / 100) + 1; // Calcular nivel basado en XP
+      const nivelEstudiante = Math.floor(estudiante.xp / 100) + 1;
 
-      const systemPrompt = `
-        Eres un tutor educativo especializado en ayudar a estudiantes.
-        
-        Información del estudiante:
-        - Nombre: ${estudiante.nombre}
-        - Nivel: ${nivelEstudiante}
-        ${temaActual ? `- Tema actual de estudio: ${temaActual}` : ""}
-        
-        Tu objetivo es:
-        1. Proporcionar explicaciones claras y concisas
-        2. Adaptar tus respuestas al nivel del estudiante
-        3. Fomentar el pensamiento crítico
-        4. Ser amigable y motivador
-        
-        Si el estudiante pregunta sobre un tema específico, proporciona información precisa y ejemplos.
-        Si pide ejercicios, genera problemas adecuados a su nivel.
-        Si necesita ayuda con un concepto, explícalo de manera sencilla.
-        
-        Responde de manera conversacional y natural, sin usar HTML ni estilos.
-        Estructura tus respuestas con secciones claras y ejemplos paso a paso.
-        
-        Usa formato markdown para estructurar tu respuesta:
-        - Usa ## para títulos de secciones
-        - Usa listas numeradas para pasos
-        - Usa **negrita** para términos importantes
-        - Usa > para destacar información relevante
-      `;
-
-      // CORREGIDO: Crear chat asegurando que el primer mensaje sea del usuario
-      // Si no hay historial, crear uno con un mensaje inicial del usuario
-      if (formattedHistory.length === 0) {
-        formattedHistory = [
-          {
-            role: "user",
-            parts: [{ text: userMessage }],
-          },
-        ];
+      // Verificar si tenemos una respuesta en caché para este mensaje
+      const cacheKey = `chat_${userId}_${userMessage.substring(0, 50)}`;
+      const cachedResponse = cache.get<string>(cacheKey);
+      
+      let responseText;
+      
+      if (cachedResponse) {
+        responseText = cachedResponse;
       } else {
-        // Asegurarse de que el mensaje actual del usuario esté en el historial
-        formattedHistory.push({
-          role: "user",
-          parts: [{ text: userMessage }],
-        });
+        try {
+          // Obtener un modelo disponible
+          const { model } = await getAvailableModel();
+          
+          const systemPrompt = `
+            Eres un tutor educativo especializado en ayudar a estudiantes.
+            
+            Información del estudiante:
+            - Nombre: ${estudiante.nombre}
+            - Nivel: ${nivelEstudiante}
+            ${temaActual ? `- Tema actual de estudio: ${temaActual}` : ""}
+            
+            Tu objetivo es:
+            1. Proporcionar explicaciones claras y concisas
+            2. Adaptar tus respuestas al nivel del estudiante
+            3. Fomentar el pensamiento crítico
+            4. Ser amigable y motivador
+            
+            Responde de manera conversacional y natural.
+            Estructura tus respuestas con secciones claras y ejemplos paso a paso.
+          `;
+          
+          // Formatear historial para el modelo - máximo 5 mensajes recientes para evitar exceder tokens
+          const recentHistory = chatHistory.slice(-5).map((msg) => ({
+            role: msg.role === "user" ? "user" : "model",
+            parts: [{ text: msg.content }],
+          }));
+          
+          // Crear contenido para la generación
+          const contents = [
+            { role: "user", parts: [{ text: systemPrompt }] }
+          ];
+          
+          // Añadir historial reciente si existe
+          if (recentHistory.length > 0) {
+            recentHistory.forEach(msg => {
+              contents.push({
+                role: msg.role as "user" | "model",
+                parts: msg.parts
+              });
+            });
+          }
+          
+          // Añadir mensaje actual
+          contents.push({ 
+            role: "user", 
+            parts: [{ text: userMessage }] 
+          });
+          
+          // Generar respuesta
+          const result = await model.generateContent({
+            contents,
+            generationConfig: {
+              maxOutputTokens: maxOutputTokens,
+              temperature: 0.7,
+            },
+            safetySettings: [
+              {
+                category: HarmCategory.HARM_CATEGORY_HARASSMENT,
+                threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+              },
+              {
+                category: HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+                threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+              },
+            ],
+          });
+          
+          responseText = result.response.text();
+          
+          // Guardar en caché para futuras solicitudes similares
+          cache.set(cacheKey, responseText, 3600); // Caché por 1 hora
+        } catch (error: any) {
+          console.error("Error al generar respuesta:", error);
+          
+          // Si todos los modelos fallan, usar una respuesta de respaldo
+          responseText = generateFallbackResponse();
+        }
       }
-
-      // Crear chat con el historial formateado
-      const chat = model.startChat({
-        history: formattedHistory.slice(0, -1), // Excluir el último mensaje (que es el actual)
-        generationConfig: {
-          maxOutputTokens: maxOutputTokens,
-        },
-      });
-
-      const result = await chat.sendMessage(
-        systemPrompt + "\n\nMensaje del estudiante: " + userMessage
-      );
-      const responseText = result.response.text();
 
       // Guardar mensajes en el almacenamiento
       const chatMessages = chatStorage.messages.get(userId) || [];
@@ -1323,6 +1513,11 @@ export default defineEventHandler(async (event) => {
         content: responseText,
         timestamp: new Date(),
       });
+
+      // Limitar el historial a los últimos 20 mensajes para evitar problemas de memoria
+      if (chatMessages.length > 20) {
+        chatMessages.splice(0, chatMessages.length - 20);
+      }
 
       chatStorage.messages.set(userId, chatMessages);
 
@@ -1343,24 +1538,7 @@ export default defineEventHandler(async (event) => {
         xp: estudianteActualizado?.xp || estudiante.xp,
       };
     } catch (error: any) {
-      console.error("Error al generar respuesta con Gemini:", error);
-
-      // Manejar error de límite de tasa
-      if (error.status === 429) {
-        return {
-          status: 429,
-          message:
-            "Has alcanzado el límite de solicitudes de la API. Por favor, intenta de nuevo en unos minutos.",
-          messageType: "error",
-          error: error.message,
-        };
-      }
-
-      return {
-        text: "Lo siento, tuve un problema al procesar tu mensaje. Por favor, intenta de nuevo más tarde.",
-        messageType: "response",
-        error: error.message,
-      };
+      return handleApiError(error, userId);
     }
   } catch (error: any) {
     console.error("Error en chat.post.ts:", error);
