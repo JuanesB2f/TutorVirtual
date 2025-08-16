@@ -1,5 +1,6 @@
 generator client {
-  provider = "prisma-client-js"
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x"]
 }
 
 datasource db {
@@ -30,11 +31,11 @@ model Estudiante {
   contrasena         String
   asignaturaId       Int
   usuarioId          Int
-  xp                 Int        @default(0)
-  streak             Int        @default(0)
   lastLoginDate      DateTime   @default(now())
+  streak             Int        @default(0)
+  xp                 Int        @default(0)
   asignatura         Asignatura @relation(fields: [asignaturaId], references: [id], onDelete: Cascade)
-  usuario            Usuario    @relation(fields: [usuarioId], references: [id])
+  usuario            Usuario    @relation(fields: [usuarioId], references: [id])
 }
 
 model Asignatura {
@@ -59,7 +60,8 @@ model Material {
   idAsignatura Int
   nombre       String
   tipo         String
-  url          String     // Ahora será la URL de Supabase
+  url          String
+  temas        String[]
   asignatura   Asignatura @relation(fields: [idAsignatura], references: [id], onDelete: Cascade)
 }
 

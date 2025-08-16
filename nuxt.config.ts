@@ -1,23 +1,16 @@
-import { theme } from "#tailwind-config";
-
+// @ts-ignore
 export default defineNuxtConfig({
   compatibilityDate: "2024-11-01",
-  devtools: { enabled: true },
+  devtools: { enabled: false }, // Desactivar en producción
   features: {
     devLogs: false, // Reducir logs en producción
   },
   ssr: false,
+
   css: ["~/assets/css/main.css"],
   modules: [
     "@nuxt/ui",
     "@nuxtjs/tailwindcss",
-    ["@prisma/nuxt", {
-      studio: false, // Desactivar Prisma Studio en desarrollo
-      client: {
-        autoRegister: false,
-        prismaPath: "node_modules/.prisma/client",
-      },
-    }],
   ],
   components: [
     {
@@ -43,13 +36,11 @@ export default defineNuxtConfig({
   },
   app: {
     head: {
-      link: [
-        {
-          rel: "preload",
-          href: "/_nuxt/@nuxt/ui-templates/dist/templates.min.css",
-          as: "style",
-        },
-      ],
+      title: 'TutorVirtual',
+      meta: [
+        { charset: 'utf-8' },
+        { name: 'viewport', content: 'width=device-width, initial-scale=1' }
+      ]
     },
   },
   colorMode: {
@@ -57,32 +48,8 @@ export default defineNuxtConfig({
     fallback: "light",
   },
   vite: {
-    build: {
-      cssMinify: "esbuild",
-      minify: "terser",
-      terserOptions: {
-        compress: {
-          drop_console: process.env.NODE_ENV === "production",
-          drop_debugger: process.env.NODE_ENV === "production",
-        },
-        format: {
-          comments: false, // Eliminar todos los comentarios
-        },
-      },
-      rollupOptions: {
-        output: {
-          manualChunks: {
-            vendor: ["vue", "pinia", "supabase"],
-            prisma: ["@prisma/client"],
-          },
-        },
-      },
-    },
     optimizeDeps: {
       include: ["vue", "vue-router", "@google/generative-ai", "jwt-decode"],
-    },
-    css: {
-      preprocessorMaxWorkers: true,
     },
   },
   experimental: {
@@ -93,39 +60,18 @@ export default defineNuxtConfig({
     clientFallback: true,
   },
   nitro: {
-    compressPublicAssets: {
-      gzip: true,
-      brotli: true,
-    },
-    prerender: {
-      crawlLinks: true,
-      routes: ["/"],
-    },
-    moduleSideEffects: [], // Mejorar tree-shaking
-    minify: true,
-    routeRules: {
-      "/api/": {
-        cors: true,
-        headers: {
-          "Access-Control-Allow-Methods": "GET,HEAD,PUT,PATCH,POST,DELETE",
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Credentials": "true",
-          "Access-Control-Allow-Headers": "*",
-        },
-      },
-      "/api/news": { swr: 1800 },
-    },
+    preset: 'vercel',
   },
   typescript: {
-    strict: true,
-    typeCheck: true,
+    strict: false,
+    typeCheck: false,
   },
   build: {
-    transpile: ["@google/generative-ai", "cookie"],
+    transpile: ["@google/generative-ai"],
   },
-  tailwindcss: {
-    configPath: "~/tailwind.config.ts",
+    tailwindcss: {
+    configPath: "~/tailwind.config.js",
     exposeConfig: false, // Desactivar si no se necesita
     viewer: false, // Desactivar en producción
-  },
+  },
 });

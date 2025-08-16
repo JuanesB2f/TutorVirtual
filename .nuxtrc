@@ -1,0 +1,9 @@
+# Configuración específica para Vercel
+ssr=false
+nitro.preset=vercel
+nitro.vercel.functions={
+  "server/api/**/*.ts": {
+    "maxDuration": 30
+  }
+}
+
